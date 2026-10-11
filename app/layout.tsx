@@ -3,8 +3,8 @@ import type { Metadata, Viewport } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'v0 App',
-  description: 'Created with v0',
+  title: 'InterviewIQ — Practice with intention',
+  description: 'A focused interview practice workspace for clearer answers and stronger communication.',
   generator: 'v0.app',
   icons: {
     icon: [

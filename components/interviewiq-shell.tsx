@@ -31,7 +31,7 @@ const intelligenceNavigation = [
   { label: 'Reports', icon: BarChart3 },
 ]
 
-export function InterviewIQShell({ children }: { children: React.ReactNode }) {
+export function InterviewIQShell({ children }: { children: (props: ShellChildren) => React.ReactNode }) {
   const [view, setView] = useState<AppView>('overview')
   const [mobileOpen, setMobileOpen] = useState(false)
 
