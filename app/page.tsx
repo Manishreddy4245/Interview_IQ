@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import AnimatedMeshGradient from '@/components/animated-mesh-gradient'
 import {
   BarChart3,
   BookOpenCheck,
@@ -96,6 +97,9 @@ function Topbar({ title, onMenu }: { title: string; onMenu: () => void }) {
 function Overview({ onStart }: { onStart: () => void }) {
   return (
     <div className="page-content">
+      <section className="hero-surface">
+        <AnimatedMeshGradient />
+        <div className="hero-content">
       <section className="welcome-row">
         <div>
           <p className="eyebrow">Monday, October 12, 2026</p>
@@ -105,6 +109,8 @@ function Overview({ onStart }: { onStart: () => void }) {
         <div className="welcome-actions">
           <button className="button button-primary" onClick={onStart}><Play data-icon="inline-start" /> Start an interview</button>
           <button className="button button-secondary" disabled>Review history <span className="coming-soon">Coming soon</span></button>
+        </div>
+      </section>
         </div>
       </section>
 
@@ -165,7 +171,8 @@ function InterviewRoom({ onExit }: { onExit: () => void }) {
 
   return (
     <div className="room-page">
-      <div className="room-header"><div><p className="eyebrow">Practice session</p><h2>Tell me about your experience.</h2></div><button className="icon-button" onClick={onExit} aria-label="Exit interview"><X /></button></div>
+      <section className="room-hero"><AnimatedMeshGradient /><div className="room-header"><div><p className="eyebrow">Practice session</p><h2>Tell me about your experience.</h2></div><button className="icon-button" onClick={onExit} aria-label="Exit interview"><X /></button></div>
+      </section>
       <div className="room-layout">
         <section className="camera-panel">
           <div className="camera-frame">
