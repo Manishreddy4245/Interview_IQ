@@ -7,10 +7,36 @@ __v0_jsx-dev-runtime.ts
 .v0-trash/
 .vercel/
 
-# Environment variables
-.env*.local
+# Environment variables & secrets (exclude all real env files, preserve examples)
+.env
+.env.*
+*.env
+!.env.example
+!frontend/.env.example
+!backend/.env.example
 
-# Common ignores
-node_modules
+# Python & Virtual Environments
+.venv/
+venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+backend/.pytest_cache/
+
+# Node.js & Next.js Build Outputs
+node_modules/
+frontend/node_modules/
 .next/
+frontend/.next/
+*.tsbuildinfo
+frontend/*.tsbuildinfo
+
+# Common OS & Temporary Files
 .DS_Store
+*.bak
+*.swp
+.build_cache/
+backend/.build_cache/
+frontend/.build_cache/
