@@ -1,3 +1,4 @@
+import time
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -90,6 +91,7 @@ from app.services.session_service import (
     create_interview_session,
     submit_answer,
     save_evaluation,
+    record_answer_and_evaluation,
     record_integrity_event,
     get_integrity_events,
     record_human_review,
@@ -375,7 +377,12 @@ async def route_and_evaluate_answer(
         # Dimension 1: Execution Correctness (Weight 70%, max 70.0 pts)
         # Dimension 2: Code Quality & Parameter Contracts (Weight 15%, max 15.0 pts)
         # Dimension 3: Algorithmic Efficiency & Complexity (Weight 15%, max 15.0 pts)
-        if code_exec.compilation_error:
+        if code_exec.provider_error:
+            correctness_pts = 0.0
+            quality_pts = 5.0
+            complexity_pts = 5.0
+            overall_score = 10
+        elif code_exec.compilation_error:
             correctness_pts = 0.0
             quality_pts = 5.0
             complexity_pts = 5.0
@@ -404,12 +411,12 @@ async def route_and_evaluate_answer(
         overall_score = max(10, min(100, overall_score))
         depth_score = max(1, min(10, int(round((correctness_pts + complexity_pts) / 8.5))))
         comp_score = max(1, min(10, int(round((passed / total * 10) if total > 0 else (overall_score / 10)))))
-        struct_score = 8 if not code_exec.compilation_error else 3
-        clarity_score = 8 if not code_exec.compilation_error else 4
+        struct_score = 8 if not (code_exec.compilation_error or code_exec.provider_error) else 3
+        clarity_score = 8 if not (code_exec.compilation_error or code_exec.provider_error) else 4
 
         strengths = [
             f"Submitted solution in {code_exec.language} passed {passed} of {total} test cases."
-            if total > 0 else f"Compiled and ran {code_exec.language} solution."
+            if total > 0 and not code_exec.provider_error else f"Compiled and ran {code_exec.language} solution."
         ]
         if code_exec.all_passed:
             strengths.append(f"Execution Correctness ({int(round(correctness_pts))}/70 pts): Verified correctness across all {total} functional and boundary test cases.")
@@ -417,19 +424,31 @@ async def route_and_evaluate_answer(
             strengths.append(f"Algorithmic Complexity ({int(round(complexity_pts))}/15 pts): Executed within allotted time and resource constraints.")
 
         improvements = []
-        if code_exec.compilation_error:
+        if code_exec.provider_error:
+            improvements.append(f"Code execution provider error: {code_exec.provider_error[:250]}")
+        elif code_exec.compilation_error:
             improvements.append(f"Compilation/Runtime error: {code_exec.compilation_error[:250]}")
         elif not code_exec.all_passed and total > 0:
             improvements.append(f"Execution Correctness ({int(round(correctness_pts))}/70 pts): Failed {total - passed} of {total} test cases. Review boundary conditions and output formatting.")
         else:
             improvements.append("Consider theoretical space-time tradeoffs and potential asymptotic micro-optimizations.")
 
+        relevance_score = 9 if not (code_exec.compilation_error or code_exec.provider_error) else 4
+        if code_exec.provider_error:
+            depth_feedback = f"Execution blocked by provider: {code_exec.provider_error[:120]}"
+            comp_feedback = "Unable to verify test coverage due to execution provider error."
+            coaching_summary = f"Code execution blocked by provider: {code_exec.provider_error[:120]}"
+        else:
+            depth_feedback = f"Execution verification: {passed}/{total} tests passed ({int(round(correctness_pts))}/70 pts correctness)."
+            comp_feedback = f"Test coverage verification achieved {int(round(pass_ratio * 100)) if total > 0 else overall_score}% pass rate."
+            coaching_summary = f"Coding evaluation: {passed}/{total} tests passed ({overall_score}/100). Focus on test-driven verification."
+
         evaluation = AIEvaluationRaw(
             overall_score=overall_score,
             criterion_scores=CriterionScores(
-                relevance=CriterionScore(score=9 if not code_exec.compilation_error else 4, feedback="Solution directly implements the required algorithmic function."),
-                technical_depth=CriterionScore(score=depth_score, feedback=f"Execution verification: {passed}/{total} tests passed ({int(round(correctness_pts))}/70 pts correctness)."),
-                completeness=CriterionScore(score=comp_score, feedback=f"Test coverage verification achieved {int(round(pass_ratio * 100)) if total > 0 else overall_score}% pass rate."),
+                relevance=CriterionScore(score=relevance_score, feedback="Solution directly implements the required algorithmic function."),
+                technical_depth=CriterionScore(score=depth_score, feedback=depth_feedback),
+                completeness=CriterionScore(score=comp_score, feedback=comp_feedback),
                 structure_flow=CriterionScore(score=struct_score, feedback="Clean procedural implementation structure adhering to function signature."),
                 clarity_conciseness=CriterionScore(score=clarity_score, feedback="Direct algorithm adhering to parameter contracts."),
             ),
@@ -439,7 +458,7 @@ async def route_and_evaluate_answer(
                 "Test edge cases locally before submission (e.g. empty inputs, duplicates, extreme values).",
                 "Analyze theoretical time and space complexity."
             ],
-            coaching_summary=f"Coding evaluation: {passed}/{total} tests passed ({overall_score}/100). Focus on test-driven verification.",
+            coaching_summary=coaching_summary,
             recommended_practice=f"Practice {question_item.assessed_skill} problems on sandboxed algorithmic runners.",
             acoustic_disclaimer="Evaluated via automated sandbox execution and test-case verification.",
         )
@@ -795,7 +814,10 @@ async def submit_and_adapt_lifecycle(
     role = session.get("role", "Candidate")
     experience_level = session.get("experience_level", "Mid-Level")
 
+    t_start = time.perf_counter()
+
     # Evaluate answer through mode-appropriate pipeline
+    t_eval_0 = time.perf_counter()
     evaluation, active_mode, exec_res = await route_and_evaluate_answer(
         question_item=question_item,
         answer_payload=answer_payload,
@@ -803,17 +825,24 @@ async def submit_and_adapt_lifecycle(
         experience_level=experience_level,
         session_mode=s_mode,
     )
+    t_eval_1 = time.perf_counter()
+    eval_ms = round((t_eval_1 - t_eval_0) * 1000, 2)
 
     answer_payload.answer_mode = active_mode
     if exec_res:
         answer_payload.execution_result = exec_res
 
-    # Record answer with resolved mode and execution result
-    ans_res = await submit_answer(session_id, answer_payload)
-    saved_eval = await save_evaluation(session_id, answer_payload.question_id, evaluation)
+    # Record answer and evaluation atomically in a single operation, keeping in-memory session fresh
+    t_save_0 = time.perf_counter()
+    ans_res, saved_eval, updated_session = await record_answer_and_evaluation(
+        session_id=session_id,
+        answer_payload=answer_payload,
+        evaluation=evaluation,
+        current_session=session,
+    )
+    t_save_1 = time.perf_counter()
+    persistence_ms = round((t_save_1 - t_save_0) * 1000, 2)
 
-    # Refresh session to reflect newly stored answer and evaluation
-    updated_session = await get_session(session_id) or session
     competency_state = compute_session_competency_state(updated_session)
 
     # Check if target question count reached or session complete
@@ -824,13 +853,19 @@ async def submit_and_adapt_lifecycle(
     next_question: Optional[QuestionItem] = None
     next_active_id = active_q
     next_res = None
+    adapt_ms = 0.0
 
     if not is_last and updated_session.get("is_adaptive"):
-        # Adapt and formulate the next question based on evidence
+        # Adapt and formulate the next question based on evidence, reusing updated_session
+        t_adapt_0 = time.perf_counter()
         next_res = await generate_next_adaptive_question(
             session_id,
+            current_session=updated_session,
             client_remaining_seconds=time_status["effective_remaining_seconds"],
         )
+        t_adapt_1 = time.perf_counter()
+        adapt_ms = round((t_adapt_1 - t_adapt_0) * 1000, 2)
+
         if hasattr(next_res, "question"):
             next_question = next_res.question
             next_active_id = next_res.active_question_id or (next_res.question.id if next_res.question else None)
@@ -844,6 +879,25 @@ async def submit_and_adapt_lifecycle(
         msg = f"Answer evaluated in {active_mode.upper()} mode. Question {q_num} adapted and issued."
     else:
         msg = f"Answer evaluated in {active_mode.upper()} mode. Target interview questions completed."
+
+    t_end = time.perf_counter()
+    total_ms = round((t_end - t_start) * 1000, 2)
+    stage_timings = {
+        "evaluation_ms": eval_ms,
+        "persistence_ms": persistence_ms,
+        "adaptation_ms": adapt_ms,
+        "total_ms": total_ms,
+    }
+    logger.info(
+        "[Adaptive Lifecycle Timing] session=%s q=%s mode=%s: eval=%.1fms, persistence=%.1fms, adaptation=%.1fms, total=%.1fms",
+        session_id,
+        answer_payload.question_id,
+        active_mode,
+        eval_ms,
+        persistence_ms,
+        adapt_ms,
+        total_ms,
+    )
 
     # Compute top-level persistence status reflecting the full lifecycle:
     # Evaluation persistence + session update / next question persistence
@@ -897,6 +951,7 @@ async def submit_and_adapt_lifecycle(
         db_status=overall_db_status,
         db_message=overall_db_msg,
         adaptive_decision=adaptive_dec,
+        stage_timings=stage_timings,
         message=msg,
     )
 

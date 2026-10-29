@@ -100,9 +100,9 @@ async def evaluate_candidate_answer(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.3,
-        max_tokens=2048,
-        timeout=30.0,
+        temperature=0.25,
+        max_tokens=950,
+        timeout=25.0,
         reasoning_effort="low",
         response_format={"type": "json_object"},
     )

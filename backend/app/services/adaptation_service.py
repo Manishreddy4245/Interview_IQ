@@ -474,6 +474,7 @@ def generate_time_aware_fallback_question(
 async def generate_next_adaptive_question(
     session_id: str,
     client_remaining_seconds: Optional[int] = None,
+    current_session: Optional[Dict[str, Any]] = None,
 ) -> NextQuestionResponse:
     """
     Generate the next-best question dynamically using candidate's prior answers,
@@ -484,15 +485,17 @@ async def generate_next_adaptive_question(
         return await _generate_next_adaptive_question_locked(
             session_id,
             client_remaining_seconds=client_remaining_seconds,
+            current_session=current_session,
         )
 
 
 async def _generate_next_adaptive_question_locked(
     session_id: str,
     client_remaining_seconds: Optional[int] = None,
+    current_session: Optional[Dict[str, Any]] = None,
 ) -> NextQuestionResponse:
-    # 1. Fetch session
-    session = await get_session(session_id)
+    # 1. Fetch session (reuse provided current_session to avoid redundant DB round-trip)
+    session = current_session or await get_session(session_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -632,27 +635,25 @@ async def _generate_next_adaptive_question_locked(
                 evidence_parts.append("Criterion scores: " + ", ".join(crit_parts[:6]))
 
         if strengths:
-            evidence_parts.append("Strengths: " + "; ".join(str(x) for x in strengths[:3]))
+            evidence_parts.append("Strengths: " + "; ".join(str(x) for x in strengths[:2]))
         if improvements:
-            evidence_parts.append("Improvement gaps: " + "; ".join(str(x) for x in improvements[:4]))
-        if suggestions:
-            evidence_parts.append("Practice suggestions: " + "; ".join(str(x) for x in suggestions[:3]))
+            evidence_parts.append("Improvement gaps: " + "; ".join(str(x) for x in improvements[:3]))
         if coaching:
-            evidence_parts.append("Evaluation summary: " + str(coaching))
+            evidence_parts.append("Evaluation summary: " + str(coaching)[:200])
 
         evidence = " | ".join(evidence_parts) or "No evaluation feedback available"
         candidate_ans_display = (
-            answer_text[:1500]
+            answer_text[:300]
             if answer_text
-            else "No candidate answer text stored (limitation: answer text not available in session record)"
+            else "No candidate answer text stored."
         )
 
         prior_context_items.append(
             f"- Q{idx} | Skill: {q_skill} | Difficulty: {q_diff}\n"
-            f"  Question: {q_text[:1000]}\n"
+            f"  Question: {q_text[:200]}\n"
             f"  Candidate answer: {candidate_ans_display}\n"
             f"  Score: {score_str}\n"
-            f"  Evaluation evidence: {evidence[:1800]}"
+            f"  Evaluation evidence: {evidence[:350]}"
         )
 
     prior_summary = (
@@ -816,9 +817,9 @@ async def _generate_next_adaptive_question_locked(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": current_u_prompt},
             ],
-            temperature=0.6 + (attempt * 0.1),
-            max_tokens=2500,
-            timeout=30.0,
+            temperature=0.35 + (attempt * 0.1),
+            max_tokens=1100 if session_mode == "CODING" else 750,
+            timeout=25.0,
             reasoning_effort="low",
         )
 
@@ -931,7 +932,7 @@ async def _generate_next_adaptive_question_locked(
         ) from exc
 
     # 8. Persist to session
-    updated_session = await append_session_question(session_id, new_question)
+    updated_session = await append_session_question(session_id, new_question, current_session=session)
 
     # 9. Re-compute competency state
     updated_competency = compute_session_competency_state(updated_session)

@@ -20,18 +20,75 @@ from app.schemas.execution import (
     CodeSubmissionResult,
 )
 
+from app.core.config import settings
+
 logger = logging.getLogger("interviewiq.code_execution")
 
-PISTON_API_URL = os.environ.get("PISTON_API_URL", "https://emkc.org/api/v2/piston/execute")
-PISTON_API_KEY = os.environ.get("PISTON_API_KEY")
+
+def _find_binary(*candidates: str) -> Optional[str]:
+    """Find binary executable across common system installation locations."""
+    for cand in candidates:
+        if not cand:
+            continue
+        which = shutil.which(cand)
+        if which and os.path.exists(which):
+            return which
+        if os.path.exists(cand):
+            return cand
+    return None
+
 
 # Local compiler / runtime binary discovery
-PYTHON_BIN = sys.executable
-NODE_BIN = shutil.which("node") or (r"C:\Program Files\nodejs\node.exe" if os.path.exists(r"C:\Program Files\nodejs\node.exe") else None)
-GCC_BIN = shutil.which("gcc") or (r"C:\MinGW\bin\gcc.exe" if os.path.exists(r"C:\MinGW\bin\gcc.exe") else None)
-GPP_BIN = shutil.which("g++") or (r"C:\MinGW\bin\g++.exe" if os.path.exists(r"C:\MinGW\bin\g++.exe") else None)
-JAVAC_BIN = shutil.which("javac") or (r"C:\Program Files\Common Files\Oracle\Java\javapath\javac.exe" if os.path.exists(r"C:\Program Files\Common Files\Oracle\Java\javapath\javac.exe") else None)
-JAVA_BIN = shutil.which("java") or (r"C:\Program Files\Common Files\Oracle\Java\javapath\java.exe" if os.path.exists(r"C:\Program Files\Common Files\Oracle\Java\javapath\java.exe") else None)
+PYTHON_BIN = sys.executable or _find_binary("python", "python3")
+NODE_BIN = _find_binary(
+    "node",
+    r"C:\Program Files\nodejs\node.exe",
+    r"C:\Program Files (x86)\nodejs\node.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\node\node.exe"),
+)
+GCC_BIN = _find_binary(
+    "gcc",
+    r"C:\MinGW\bin\gcc.exe",
+    r"C:\msys64\mingw64\bin\gcc.exe",
+    r"C:\Program Files\Git\usr\bin\gcc.exe",
+)
+GPP_BIN = _find_binary(
+    "g++",
+    r"C:\MinGW\bin\g++.exe",
+    r"C:\msys64\mingw64\bin\g++.exe",
+)
+JAVAC_BIN = _find_binary(
+    "javac",
+    r"C:\Program Files\Common Files\Oracle\Java\javapath\javac.exe",
+    r"C:\Program Files\Java\jdk-21\bin\javac.exe",
+    r"C:\Program Files\Java\jdk-17\bin\javac.exe",
+    r"C:\Program Files\Java\jdk-11\bin\javac.exe",
+)
+JAVA_BIN = _find_binary(
+    "java",
+    r"C:\Program Files\Common Files\Oracle\Java\javapath\java.exe",
+    r"C:\Program Files\Java\jdk-21\bin\java.exe",
+    r"C:\Program Files\Java\jdk-17\bin\java.exe",
+    r"C:\Program Files\Java\jdk-11\bin\java.exe",
+)
+
+# Judge0 language ID mappings (Judge0 CE standard)
+JUDGE0_LANGUAGE_IDS: Dict[str, int] = {
+    "python": 71,       # Python (3.8.1+)
+    "javascript": 63,   # JavaScript (Node.js 12.14.0+)
+    "typescript": 74,   # TypeScript (3.7.4+)
+    "java": 62,         # Java (OpenJDK 13.0.1+)
+    "cpp": 54,          # C++ (GCC 9.2.0+)
+    "c": 50,            # C (GCC 9.2.0+)
+    "csharp": 51,       # C# (Mono 6.6.0.161)
+    "go": 60,           # Go (1.13.5)
+    "rust": 73,         # Rust (1.40.0)
+    "kotlin": 78,       # Kotlin (1.3.70)
+    "php": 68,          # PHP (7.4.1)
+    "ruby": 72,         # Ruby (2.7.0)
+    "swift": 83,        # Swift (5.2.3)
+    "scala": 81,        # Scala (2.13.2)
+}
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUILD_CACHE_DIR = os.path.join(BACKEND_DIR, ".build_cache")
@@ -1769,39 +1826,50 @@ def execute_code_locally(
     return None
 
 
-async def execute_code_sandboxed(
+def get_configured_piston_url() -> Optional[str]:
+    """
+    Get configured Piston URL.
+    Safely rejects un-whitelisted default emkc.org public endpoint unless an explicit API key is set.
+    """
+    url = getattr(settings, "PISTON_API_URL", None) or os.environ.get("PISTON_API_URL")
+    if not url:
+        return None
+    url = url.strip()
+    api_key = getattr(settings, "PISTON_API_KEY", None) or os.environ.get("PISTON_API_KEY")
+    # If URL is still the legacy public endpoint and no key is configured, treat as unconfigured
+    if "emkc.org" in url and not api_key:
+        return None
+    return url
+
+
+def get_configured_judge0_url() -> Optional[str]:
+    """
+    Get configured Judge0 submissions URL.
+    Returns RapidAPI endpoint if JUDGE0_API_KEY is configured, or custom self-hosted endpoint.
+    """
+    custom_url = getattr(settings, "JUDGE0_API_URL", None) or os.environ.get("JUDGE0_API_URL")
+    if custom_url and custom_url.strip():
+        return custom_url.strip()
+    api_key = getattr(settings, "JUDGE0_API_KEY", None) or os.environ.get("JUDGE0_API_KEY")
+    if api_key and api_key.strip():
+        return "https://judge0-ce.p.rapidapi.com/submissions?wait=true&base64_encoded=false"
+    return None
+
+
+def execute_code_via_piston(
     language: str,
-    code: str,
-    stdin: str = "",
-    timeout_sec: float = 8.0,
-    function_name: Optional[str] = None,
+    executable_code: str,
+    stdin: str,
+    timeout_sec: float,
+    config: Dict[str, Any],
+    piston_url: str,
+    piston_api_key: Optional[str] = None,
 ) -> CodeExecutionResponse:
-    """
-    Execute code in a sandboxed runtime.
-    Prioritizes local isolated runner for Python, JavaScript, C++, C, and Java.
-    Falls back to configured Piston runner when available.
-    """
+    """Execute code using a Piston-compatible instance (self-hosted or hosted with API key)."""
     lang_key = language.lower().strip()
-    config = LANGUAGE_CONFIGS.get(lang_key)
-
-    if not config:
-        return CodeExecutionResponse(
-            status="error",
-            error=f"Language '{language}' is not supported. Supported: {list(LANGUAGE_CONFIGS.keys())}",
-            stderr=f"Language '{language}' is not supported.",
-            exit_code=1,
-        )
-
-    # 1. Attempt local execution runner first
-    local_res = execute_code_locally(language, code, stdin=stdin, timeout_sec=timeout_sec, function_name=function_name)
-    if local_res is not None:
-        return local_res
-
-    executable_code = wrap_code_with_driver_if_needed(language, code, function_name)
-
-    if lang_key == "java" and not re.search(r"\b(public\s+)?static\s+void\s+main\s*\(", code):
+    if lang_key == "java" and not re.search(r"\b(public\s+)?static\s+void\s+main\s*\(", executable_code):
         files_payload = [
-            {"name": "Solution.java", "content": code},
+            {"name": "Solution.java", "content": executable_code},
             {"name": "Main.java", "content": JAVA_LEETCODE_DRIVER_SOURCE},
         ]
     else:
@@ -1823,21 +1891,18 @@ async def execute_code_sandboxed(
 
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "InterviewIQ-ExecutionEngine/1.0",
+        "User-Agent": "InterviewIQ-ExecutionEngine/2.0",
     }
-    if PISTON_API_KEY:
-        headers["Authorization"] = PISTON_API_KEY
+    if piston_api_key:
+        headers["Authorization"] = piston_api_key
+        headers["x-api-key"] = piston_api_key
 
     req_data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        PISTON_API_URL,
-        data=req_data,
-        headers=headers,
-    )
+    req = urllib.request.Request(piston_url, data=req_data, headers=headers)
 
     start_time = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec + 4.0) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_sec + 6.0) as resp:
             elapsed_ms = round((time.time() - start_time) * 1000, 2)
             result_data = json.loads(resp.read().decode("utf-8"))
 
@@ -1854,6 +1919,7 @@ async def execute_code_sandboxed(
                 execution_time_ms=elapsed_ms,
                 status="compilation_error",
                 error=compile_stderr,
+                provider="piston",
             )
 
         stdout = run_info.get("stdout", "")
@@ -1880,6 +1946,7 @@ async def execute_code_sandboxed(
             execution_time_ms=elapsed_ms,
             status=status,
             error=err_msg,
+            provider="piston",
         )
 
     except urllib.error.HTTPError as exc:
@@ -1893,31 +1960,276 @@ async def execute_code_sandboxed(
 
         return CodeExecutionResponse(
             status="error",
-            error=f"Execution provider error: {msg}",
-            stderr=f"Execution provider error: {msg}",
+            error=f"Piston provider error ({exc.code}): {msg}",
+            stderr=f"Piston provider error ({exc.code}): {msg}",
             exit_code=1,
             execution_time_ms=elapsed_ms,
+            provider="piston",
         )
 
     except urllib.error.URLError as exc:
         elapsed_ms = round((time.time() - start_time) * 1000, 2)
         return CodeExecutionResponse(
             status="error",
-            error=f"Execution provider unavailable ({exc.reason}). Supported local languages: Python 3, JavaScript (Node.js), C++, C, Java, SQL.",
-            stderr=f"Execution provider unavailable ({exc.reason}).",
+            error=f"Piston provider unavailable: {exc.reason}",
+            stderr=f"Piston provider unavailable: {exc.reason}",
             exit_code=1,
             execution_time_ms=elapsed_ms,
+            provider="piston",
         )
 
     except Exception as exc:
         elapsed_ms = round((time.time() - start_time) * 1000, 2)
         return CodeExecutionResponse(
             status="error",
-            error=f"Unexpected execution error: {type(exc).__name__}: {str(exc)}",
+            error=f"Piston execution error: {type(exc).__name__}: {str(exc)}",
             stderr=str(exc),
             exit_code=1,
             execution_time_ms=elapsed_ms,
+            provider="piston",
         )
+
+
+def execute_code_via_judge0(
+    language: str,
+    executable_code: str,
+    stdin: str,
+    timeout_sec: float,
+    judge0_url: str,
+    judge0_api_key: Optional[str] = None,
+    judge0_host: Optional[str] = "judge0-ce.p.rapidapi.com",
+) -> CodeExecutionResponse:
+    """Execute code using Judge0 CE API (RapidAPI or self-hosted instance)."""
+    lang_key = language.lower().strip()
+    judge0_lang_id = JUDGE0_LANGUAGE_IDS.get(lang_key)
+    if not judge0_lang_id:
+        return CodeExecutionResponse(
+            status="error",
+            error=f"Language '{language}' does not have a mapped Judge0 runtime ID.",
+            exit_code=1,
+            provider="judge0",
+        )
+
+    payload = {
+        "source_code": executable_code,
+        "language_id": judge0_lang_id,
+        "stdin": stdin,
+        "cpu_time_limit": min(timeout_sec, 15.0),
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "InterviewIQ-ExecutionEngine/2.0",
+    }
+    if judge0_api_key:
+        headers["X-RapidAPI-Key"] = judge0_api_key
+        headers["X-RapidAPI-Host"] = judge0_host or "judge0-ce.p.rapidapi.com"
+        headers["X-Auth-Token"] = judge0_api_key
+
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(judge0_url, data=req_data, headers=headers)
+
+    start_time = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec + 8.0) as resp:
+            elapsed_ms = round((time.time() - start_time) * 1000, 2)
+            result_data = json.loads(resp.read().decode("utf-8"))
+
+        status_obj = result_data.get("status", {})
+        status_id = status_obj.get("id", 0)
+        stdout = result_data.get("stdout") or ""
+        stderr = result_data.get("stderr") or ""
+        compile_output = result_data.get("compile_output") or ""
+        time_taken = result_data.get("time")
+        exec_time_ms = round(float(time_taken) * 1000, 2) if time_taken else elapsed_ms
+
+        if status_id == 6 or compile_output:
+            return CodeExecutionResponse(
+                stdout="",
+                stderr=compile_output,
+                output=compile_output,
+                exit_code=1,
+                execution_time_ms=exec_time_ms,
+                status="compilation_error",
+                error=compile_output.strip() or "Compilation failed.",
+                provider="judge0",
+            )
+        elif status_id == 5 or "time limit exceeded" in (status_obj.get("description") or "").lower():
+            return CodeExecutionResponse(
+                stdout=stdout,
+                stderr="Execution timed out.",
+                output="Execution timed out.",
+                exit_code=124,
+                execution_time_ms=exec_time_ms,
+                status="timeout",
+                error=f"Execution timed out after {timeout_sec} seconds.",
+                provider="judge0",
+            )
+        elif status_id in (7, 8, 9, 10, 11, 12) or (stderr and status_id not in (3, 4)):
+            return CodeExecutionResponse(
+                stdout=stdout,
+                stderr=stderr,
+                output=stderr or stdout,
+                exit_code=1,
+                execution_time_ms=exec_time_ms,
+                status="runtime_error",
+                error=stderr.strip() or status_obj.get("description", "Runtime error"),
+                provider="judge0",
+            )
+        elif status_id in (3, 4):
+            # Status 3 (Accepted) or 4 (Wrong Answer) - output comparison logic handles pass/fail
+            return CodeExecutionResponse(
+                stdout=stdout,
+                stderr=stderr,
+                output=stdout or stderr,
+                exit_code=0,
+                execution_time_ms=exec_time_ms,
+                status="success",
+                error=None,
+                provider="judge0",
+            )
+        else:
+            return CodeExecutionResponse(
+                status="error",
+                error=f"Judge0 provider status {status_id}: {status_obj.get('description', 'Unknown status')}",
+                stderr=stderr or compile_output,
+                exit_code=1,
+                execution_time_ms=exec_time_ms,
+                provider="judge0",
+            )
+
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = round((time.time() - start_time) * 1000, 2)
+        try:
+            err_body = exc.read().decode("utf-8")
+            err_json = json.loads(err_body)
+            msg = err_json.get("message", f"HTTP {exc.code}: {exc.reason}")
+        except Exception:
+            msg = f"HTTP {exc.code}: {exc.reason}"
+
+        return CodeExecutionResponse(
+            status="error",
+            error=f"Judge0 provider error ({exc.code}): {msg}",
+            stderr=f"Judge0 provider error ({exc.code}): {msg}",
+            exit_code=1,
+            execution_time_ms=elapsed_ms,
+            provider="judge0",
+        )
+
+    except urllib.error.URLError as exc:
+        elapsed_ms = round((time.time() - start_time) * 1000, 2)
+        return CodeExecutionResponse(
+            status="error",
+            error=f"Judge0 provider unavailable: {exc.reason}",
+            stderr=f"Judge0 provider unavailable: {exc.reason}",
+            exit_code=1,
+            execution_time_ms=elapsed_ms,
+            provider="judge0",
+        )
+
+    except Exception as exc:
+        elapsed_ms = round((time.time() - start_time) * 1000, 2)
+        return CodeExecutionResponse(
+            status="error",
+            error=f"Judge0 execution error: {type(exc).__name__}: {str(exc)}",
+            stderr=str(exc),
+            exit_code=1,
+            execution_time_ms=elapsed_ms,
+            provider="judge0",
+        )
+
+
+async def execute_code_sandboxed(
+    language: str,
+    code: str,
+    stdin: str = "",
+    timeout_sec: float = 8.0,
+    function_name: Optional[str] = None,
+) -> CodeExecutionResponse:
+    """
+    Execute code in a sandboxed runtime.
+    Execution hierarchy:
+    1. Local isolated subprocess runner (instant, deterministic for Python, JavaScript, C++, C, Java).
+    2. Configured Piston runner (self-hosted or hosted with valid API key).
+    3. Configured Judge0 runner (RapidAPI or self-hosted).
+    4. Honest diagnostic provider error detailing required environment variables.
+    """
+    lang_key = language.lower().strip()
+    config = LANGUAGE_CONFIGS.get(lang_key)
+
+    if not config:
+        return CodeExecutionResponse(
+            status="error",
+            error=f"Language '{language}' is not supported. Supported: {list(LANGUAGE_CONFIGS.keys())}",
+            stderr=f"Language '{language}' is not supported.",
+            exit_code=1,
+        )
+
+    # 1. Attempt local execution runner first
+    local_res = execute_code_locally(language, code, stdin=stdin, timeout_sec=timeout_sec, function_name=function_name)
+    if local_res is not None:
+        local_res.provider = "local"
+        return local_res
+
+    executable_code = wrap_code_with_driver_if_needed(language, code, function_name)
+
+    # 2. Check for configured Piston provider
+    piston_url = get_configured_piston_url()
+    piston_api_key = getattr(settings, "PISTON_API_KEY", None) or os.environ.get("PISTON_API_KEY")
+    if piston_url:
+        return execute_code_via_piston(
+            language=language,
+            executable_code=executable_code,
+            stdin=stdin,
+            timeout_sec=timeout_sec,
+            config=config,
+            piston_url=piston_url,
+            piston_api_key=piston_api_key,
+        )
+
+    # 3. Check for configured Judge0 provider
+    judge0_url = get_configured_judge0_url()
+    judge0_api_key = getattr(settings, "JUDGE0_API_KEY", None) or os.environ.get("JUDGE0_API_KEY")
+    judge0_host = getattr(settings, "JUDGE0_HOST", "judge0-ce.p.rapidapi.com") or os.environ.get("JUDGE0_HOST", "judge0-ce.p.rapidapi.com")
+    if judge0_url and judge0_api_key:
+        return execute_code_via_judge0(
+            language=language,
+            executable_code=executable_code,
+            stdin=stdin,
+            timeout_sec=timeout_sec,
+            judge0_url=judge0_url,
+            judge0_api_key=judge0_api_key,
+            judge0_host=judge0_host,
+        )
+
+    # 4. Informative diagnostic state when no remote provider is configured
+    local_available = []
+    if PYTHON_BIN:
+        local_available.append("Python 3")
+    if NODE_BIN:
+        local_available.append("JavaScript/TypeScript")
+    if GPP_BIN:
+        local_available.append("C++")
+    if GCC_BIN:
+        local_available.append("C")
+    if JAVAC_BIN and JAVA_BIN:
+        local_available.append("Java")
+    local_available.append("SQL")
+    local_summary = ", ".join(local_available)
+
+    return CodeExecutionResponse(
+        status="error",
+        error=(
+            f"Execution provider not configured: The public Piston API (emkc.org) is restricted "
+            f"(whitelist-only as of 2/15/2026). To execute '{language}', please configure a remote execution provider "
+            f"in backend/.env by setting PISTON_API_URL (and optional PISTON_API_KEY for self-hosted/hosted Piston) "
+            f"or JUDGE0_API_KEY (and optional JUDGE0_API_URL for Judge0 CE). "
+            f"Locally operational languages on this server: {local_summary}."
+        ),
+        stderr=f"Execution provider unavailable for '{language}'.",
+        exit_code=1,
+        execution_time_ms=0.0,
+    )
 
 
 async def evaluate_code_against_test_cases(
@@ -1933,7 +2245,8 @@ async def evaluate_code_against_test_cases(
     Run candidate code sequentially against all test cases for a question.
     Uses language-independent structural output comparison engine.
     Ensures hidden test inputs and expected outputs are never leaked to candidate.
-    Never fabricates test results if test cases are missing.
+    Distinguishes compilation, runtime, and execution provider errors.
+    Never marks a solution as accepted if execution failed.
     """
     if not test_cases:
         # Honest state: test cases not configured on question definition
@@ -1951,6 +2264,7 @@ async def evaluate_code_against_test_cases(
     results: List[TestCaseResult] = []
     passed_count = 0
     compilation_error: Optional[str] = None
+    provider_error: Optional[str] = None
 
     for tc in test_cases:
         exec_res = await execute_code_sandboxed(
@@ -1959,6 +2273,25 @@ async def evaluate_code_against_test_cases(
             stdin=tc.input,
             function_name=function_name,
         )
+
+        # Distinguish upstream execution provider errors (do not misattribute to candidate code)
+        if exec_res.status == "error":
+            provider_error = exec_res.error or "Execution provider unavailable."
+            results.append(
+                TestCaseResult(
+                    test_case_id=tc.id,
+                    input=tc.input if not tc.is_hidden else "[Hidden Test Case]",
+                    expected_output=tc.expected_output if not tc.is_hidden else "[Hidden Expected Output]",
+                    actual_output=f"[Execution Provider Error: {provider_error}]",
+                    passed=False,
+                    is_hidden=tc.is_hidden,
+                    execution_time_ms=exec_res.execution_time_ms,
+                    error=provider_error,
+                    comparison_policy=comparison_policy,
+                )
+            )
+            # Abort subsequent runs on provider failure
+            break
 
         if exec_res.status == "compilation_error":
             compilation_error = exec_res.stderr or exec_res.error or exec_res.output
@@ -2024,7 +2357,17 @@ async def evaluate_code_against_test_cases(
             )
         )
 
-    all_passed = (passed_count == len(test_cases) and compilation_error is None)
+    all_passed = (
+        passed_count == len(test_cases)
+        and compilation_error is None
+        and provider_error is None
+    )
+
+    final_status = "evaluated"
+    if provider_error:
+        final_status = "provider_error"
+    elif compilation_error:
+        final_status = "compilation_error"
 
     return CodeSubmissionResult(
         question_id=question_id,
@@ -2033,6 +2376,7 @@ async def evaluate_code_against_test_cases(
         passed_tests=passed_count,
         all_passed=all_passed,
         results=results,
-        status="evaluated",
+        status=final_status,
         compilation_error=compilation_error,
+        provider_error=provider_error,
     )

@@ -214,6 +214,7 @@ async def create_interview_session(
 async def append_session_question(
     session_id: str,
     question: QuestionItem,
+    current_session: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Append a dynamically generated question to an existing interview session.
@@ -223,7 +224,7 @@ async def append_session_question(
     now = datetime.now(timezone.utc)
     q_dict = question.model_dump()
 
-    session = await get_session(session_id)
+    session = current_session or await get_session(session_id)
     if not session:
         raise ValueError(f"Session '{session_id}' not found.")
 
@@ -326,6 +327,7 @@ async def complete_session(session_id: str) -> None:
 async def submit_answer(
     session_id: str,
     answer_data: SubmitAnswerRequest,
+    current_session: Optional[Dict[str, Any]] = None,
 ) -> SubmitAnswerResponse:
     """
     Submit an answer for a specific question within a session.
@@ -337,7 +339,7 @@ async def submit_answer(
     db_status = "unconfigured"
     message = "Answer recorded in-memory for active session."
 
-    session = await get_session(session_id)
+    session = current_session or await get_session(session_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -374,22 +376,25 @@ async def submit_answer(
             ),
         )
 
-    # Update in-memory session if found
+    # Update session dictionary directly
+    if "answers" not in session:
+        session["answers"] = {}
+    existing_q = session["answers"].get(answer_data.question_id, {})
+    session["answers"][answer_data.question_id] = {
+        **existing_q,
+        "answer_text": answer_data.answer_text or "",
+        "answer_mode": answer_data.answer_mode,
+        "code": answer_data.code,
+        "language": answer_data.language,
+        "sql_query": answer_data.sql_query,
+        "execution_result": answer_data.execution_result,
+        "submitted_at": now.isoformat(),
+    }
+    session["updated_at"] = now.isoformat()
+
+    # Update in-memory cache
     if session_id in _in_memory_sessions:
-        if "answers" not in _in_memory_sessions[session_id]:
-            _in_memory_sessions[session_id]["answers"] = {}
-        existing_q = _in_memory_sessions[session_id]["answers"].get(answer_data.question_id, {})
-        _in_memory_sessions[session_id]["answers"][answer_data.question_id] = {
-            **existing_q,
-            "answer_text": answer_data.answer_text or "",
-            "answer_mode": answer_data.answer_mode,
-            "code": answer_data.code,
-            "language": answer_data.language,
-            "sql_query": answer_data.sql_query,
-            "execution_result": answer_data.execution_result,
-            "submitted_at": now.isoformat(),
-        }
-        _in_memory_sessions[session_id]["updated_at"] = now.isoformat()
+        _in_memory_sessions[session_id] = session
 
     # Attempt MongoDB update if configured
     if settings.is_mongodb_configured:
@@ -442,6 +447,7 @@ async def save_evaluation(
     session_id: str,
     question_id: str,
     evaluation: AIEvaluationRaw,
+    current_session: Optional[Dict[str, Any]] = None,
 ) -> AnswerEvaluationResponse:
     """
     Persist evaluation results into the interview session.
@@ -455,14 +461,16 @@ async def save_evaluation(
     eval_dict = evaluation.model_dump()
 
     # Update in-memory session
-    if session_id in _in_memory_sessions:
-        if "answers" not in _in_memory_sessions[session_id]:
-            _in_memory_sessions[session_id]["answers"] = {}
-        if question_id not in _in_memory_sessions[session_id]["answers"]:
-            _in_memory_sessions[session_id]["answers"][question_id] = {}
-        _in_memory_sessions[session_id]["answers"][question_id]["evaluation"] = eval_dict
-        _in_memory_sessions[session_id]["answers"][question_id]["evaluated_at"] = now.isoformat()
-        _in_memory_sessions[session_id]["updated_at"] = now.isoformat()
+    target_session = current_session or _in_memory_sessions.get(session_id)
+    if target_session:
+        if "answers" not in target_session:
+            target_session["answers"] = {}
+        if question_id not in target_session["answers"]:
+            target_session["answers"][question_id] = {}
+        target_session["answers"][question_id]["evaluation"] = eval_dict
+        target_session["answers"][question_id]["evaluated_at"] = now.isoformat()
+        target_session["updated_at"] = now.isoformat()
+        _in_memory_sessions[session_id] = target_session
 
     # Attempt MongoDB update if configured
     if settings.is_mongodb_configured:
@@ -516,6 +524,147 @@ async def save_evaluation(
         db_status=db_status,
         db_message=db_message,
     )
+
+
+async def record_answer_and_evaluation(
+    session_id: str,
+    answer_data: Optional[SubmitAnswerRequest] = None,
+    evaluation: Optional[AIEvaluationRaw] = None,
+    current_session: Optional[Dict[str, Any]] = None,
+    answer_payload: Optional[SubmitAnswerRequest] = None,
+) -> Tuple[SubmitAnswerResponse, AnswerEvaluationResponse, Dict[str, Any]]:
+    """
+    Combined atomic submission and evaluation persistence.
+    Reduces MongoDB network round-trips by performing a single combined update.
+    Returns (SubmitAnswerResponse, AnswerEvaluationResponse, updated_session).
+    """
+    actual_answer = answer_payload or answer_data
+    if actual_answer is None:
+        raise ValueError("answer_data or answer_payload is required")
+    answer_data = actual_answer
+    if evaluation is None:
+        raise ValueError("evaluation is required")
+
+    now = datetime.now(timezone.utc)
+    saved_to_db = False
+    db_status = "unconfigured"
+    db_message = "Answer and evaluation recorded in-memory for active session."
+
+    session = current_session or await get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Interview session '{session_id}' not found.",
+        )
+
+    if session.get("status") == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Interview session '{session_id}' has already been completed.",
+        )
+
+    if session.get("is_unreliable_mode") or session.get("interview_mode") == "AMBIGUOUS":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Interview session mode is ambiguous or unreliable due to inconsistent question history. Please restart a new Coding or Verbal interview session.",
+        )
+
+    timing = compute_session_time_status(session)
+    if timing["is_expired"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Interview session time has expired. Cannot submit additional answers.",
+        )
+
+    question_ids = [q["id"] for q in session.get("questions", [])]
+    if answer_data.question_id not in question_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Question '{answer_data.question_id}' was never issued to this interview session. Issued: {question_ids}",
+        )
+
+    eval_dict = evaluation.model_dump()
+    answer_entry: Dict[str, Any] = {
+        "answer_text": answer_data.answer_text or "",
+        "submitted_at": now.isoformat(),
+        "evaluation": eval_dict,
+        "evaluated_at": now.isoformat(),
+    }
+    if answer_data.answer_mode is not None:
+        answer_entry["answer_mode"] = answer_data.answer_mode
+    if answer_data.code is not None:
+        answer_entry["code"] = answer_data.code
+    if answer_data.language is not None:
+        answer_entry["language"] = answer_data.language
+    if answer_data.sql_query is not None:
+        answer_entry["sql_query"] = answer_data.sql_query
+    if answer_data.execution_result is not None:
+        answer_entry["execution_result"] = answer_data.execution_result
+
+    # Update in-memory session directly
+    if "answers" not in session:
+        session["answers"] = {}
+    session["answers"][answer_data.question_id] = answer_entry
+    session["updated_at"] = now.isoformat()
+    _in_memory_sessions[session_id] = session
+
+    # Single combined write to MongoDB Atlas
+    if settings.is_mongodb_configured:
+        try:
+            db = db_manager.get_database()
+            update_fields: Dict[str, Any] = {
+                f"answers.{answer_data.question_id}": answer_entry,
+                "updated_at": now.isoformat(),
+            }
+            result = await db["interview_sessions"].update_one(
+                {"session_id": session_id},
+                {"$set": update_fields},
+            )
+            if result.matched_count > 0:
+                saved_to_db = True
+                db_status = "persisted"
+                db_message = "Answer and evaluation persisted to MongoDB Atlas."
+            else:
+                db_status = "not_found_in_db"
+                db_message = "Session not found in MongoDB Atlas, recorded in active memory."
+        except Exception as exc:
+            db_status = "unreachable"
+            db_message = f"MongoDB Atlas write failed: {type(exc).__name__}. Recorded in active memory."
+            logger.warning("MongoDB combined write failed for session %s: %s", session_id, type(exc).__name__)
+
+    ans_resp = SubmitAnswerResponse(
+        session_id=session_id,
+        question_id=answer_data.question_id,
+        answer_mode=answer_data.answer_mode,
+        submitted_at=now,
+        saved_to_db=saved_to_db,
+        db_status=db_status,
+        message=db_message,
+    )
+
+    eval_resp = AnswerEvaluationResponse(
+        session_id=session_id,
+        question_id=answer_data.question_id,
+        overall_score=evaluation.overall_score,
+        criterion_scores=evaluation.criterion_scores,
+        strengths=evaluation.strengths,
+        areas_for_improvement=evaluation.areas_for_improvement,
+        actionable_suggestions=evaluation.actionable_suggestions,
+        coaching_summary=evaluation.coaching_summary,
+        stronger_example_answer=getattr(evaluation, "stronger_example_answer", None),
+        recommended_practice=getattr(evaluation, "recommended_practice", None),
+        acoustic_disclaimer=getattr(
+            evaluation,
+            "acoustic_disclaimer",
+            "Evaluated based on textual and algorithmic assessment criteria.",
+        ),
+        evaluated_at=now,
+        saved_to_db=saved_to_db,
+        db_status=db_status,
+        db_message=db_message,
+    )
+
+    return ans_resp, eval_resp, session
 
 
 async def record_integrity_event(

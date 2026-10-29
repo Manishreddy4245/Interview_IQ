@@ -61,6 +61,7 @@ export interface CodeExecutionResponse {
   memory_kb?: number | null
   status: string
   error?: string | null
+  provider?: string | null
 }
 
 export interface CodeSubmissionResult {
@@ -72,6 +73,7 @@ export interface CodeSubmissionResult {
   results: TestCaseResult[]
   status: string
   compilation_error?: string | null
+  provider_error?: string | null
   estimated_time_complexity?: string | null
   estimated_space_complexity?: string | null
 }
@@ -289,6 +291,7 @@ export interface SubmitAndAdaptResponse {
   saved_to_db: boolean
   db_status: string
   adaptive_decision?: AdaptiveDecision | null
+  stage_timings?: Record<string, number> | null
   message: string
 }
 

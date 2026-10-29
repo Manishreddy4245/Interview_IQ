@@ -2651,8 +2651,11 @@ function InterviewRoom({
         const decInfo = res.adaptive_decision?.action
           ? ` • ML Adaptive Engine: ${res.adaptive_decision.action.replace(/_/g, ' ')} (${res.adaptive_decision.next_difficulty.toUpperCase()})`
           : ''
+        const timingInfo = res.stage_timings?.total_ms
+          ? ` • Evaluated & adapted in ${(res.stage_timings.total_ms / 1000).toFixed(1)}s`
+          : ''
         setAdaptationNotice(
-          `Question evaluated (${res.evaluation?.overall_score ?? 0}/100). Next adaptive question loaded.${decInfo}`
+          `Question evaluated (${res.evaluation?.overall_score ?? 0}/100). Next adaptive question loaded.${timingInfo}${decInfo}`
         )
       } else if (res.is_complete) {
         setIsSessionComplete(true)

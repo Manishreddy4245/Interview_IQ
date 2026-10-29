@@ -496,6 +496,10 @@ class SubmitAndAdaptResponse(BaseModel):
         default=None,
         description="Deterministic adaptive decision from the ML Text Assessment Model",
     )
+    stage_timings: Optional[Dict[str, float]] = Field(
+        default=None,
+        description="Measured stage timings in milliseconds (evaluation, persistence, adaptation, total)",
+    )
     message: str
 
 

@@ -24,6 +24,7 @@ class CodeExecutionResponse(BaseModel):
     memory_kb: Optional[float] = Field(default=None)
     status: str = Field(default="success", description="'success', 'runtime_error', 'compilation_error', 'timeout', 'error'")
     error: Optional[str] = None
+    provider: Optional[str] = Field(default=None, description="Active execution runner: 'local', 'piston', 'judge0'")
 
 
 class TestCase(BaseModel):
@@ -75,6 +76,7 @@ class CodeSubmissionResult(BaseModel):
     results: List[TestCaseResult]
     status: str = Field(default="evaluated")
     compilation_error: Optional[str] = None
+    provider_error: Optional[str] = None
     estimated_time_complexity: Optional[str] = None
     estimated_space_complexity: Optional[str] = None
 

@@ -66,6 +66,32 @@ class Settings(BaseSettings):
         description="JWT access token expiry in minutes",
     )
 
+    # Code execution provider settings
+    CODE_EXECUTION_PROVIDER: str = Field(
+        default="auto",
+        description="Execution provider: 'auto', 'local', 'piston', 'judge0'",
+    )
+    PISTON_API_URL: Optional[str] = Field(
+        default=None,
+        description="Piston execute endpoint (e.g. self-hosted instance or hosted provider)",
+    )
+    PISTON_API_KEY: Optional[str] = Field(
+        default=None,
+        description="Optional API key for Piston-compatible hosted instance",
+    )
+    JUDGE0_API_URL: Optional[str] = Field(
+        default=None,
+        description="Judge0 submissions endpoint (e.g. https://judge0-ce.p.rapidapi.com/submissions?wait=true)",
+    )
+    JUDGE0_API_KEY: Optional[str] = Field(
+        default=None,
+        description="RapidAPI key or authentication key for Judge0",
+    )
+    JUDGE0_HOST: str = Field(
+        default="judge0-ce.p.rapidapi.com",
+        description="Judge0 RapidAPI host header",
+    )
+
     @computed_field
     @property
     def cors_origin_list(self) -> List[str]:
