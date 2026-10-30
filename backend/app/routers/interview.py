@@ -1166,51 +1166,103 @@ async def list_available_reports(
 ) -> List[AvailableReportItem]:
     """
     Retrieve list of interview sessions and reports accessible to the authenticated user.
-    Preserves RBAC: candidates only see their own sessions or unowned records;
-    reviewers and admins see all sessions.
+    Preserves RBAC: candidates only see their own sessions and reports;
+    reviewers and admins see all sessions. Unauthenticated callers are rejected.
     """
-    user_id = current_user.get("user_id") if current_user else None
-    user_role = current_user.get("role") if current_user else None
+    if not current_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required to view available reports.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = current_user.get("user_id")
+    user_role = current_user.get("role", ROLE_CANDIDATE)
     is_candidate = (user_role == ROLE_CANDIDATE)
 
     reports_map: Dict[str, Dict[str, Any]] = {}
     sessions_list: List[Dict[str, Any]] = []
+    persisted_session_ids = set()
 
     # 1. Gather from MongoDB Atlas if configured
-    persisted_session_ids = set()
     if settings.is_mongodb_configured:
         try:
             if db_manager._db is None or db_manager.client is None:
                 db_manager.connect()
             db = db_manager.get_database()
 
-            raw_reports = await db["interview_reports"].find({}).sort("created_at", -1).to_list(500)
-            for r in raw_reports:
-                sid = r.get("session_id")
-                if sid:
-                    reports_map[sid] = r
+            if is_candidate:
+                # Query ONLY sessions owned by this candidate from MongoDB
+                raw_sessions = await db["interview_sessions"].find({"owner_id": user_id}).sort("created_at", -1).to_list(500)
+                for s in raw_sessions:
+                    sid = s.get("session_id")
+                    if sid:
+                        persisted_session_ids.add(sid)
+                sessions_list.extend(raw_sessions)
 
-            raw_sessions = await db["interview_sessions"].find({}).sort("created_at", -1).to_list(500)
-            for s in raw_sessions:
-                sid = s.get("session_id")
-                if sid:
-                    persisted_session_ids.add(sid)
-            sessions_list.extend(raw_sessions)
+                candidate_sids = list(persisted_session_ids)
+                report_query: Dict[str, Any]
+                if candidate_sids:
+                    report_query = {
+                        "$or": [
+                            {"owner_id": user_id},
+                            {"session_id": {"$in": candidate_sids}},
+                        ]
+                    }
+                else:
+                    report_query = {"owner_id": user_id}
+
+                raw_reports = await db["interview_reports"].find(report_query).sort("created_at", -1).to_list(500)
+                for r in raw_reports:
+                    sid = r.get("session_id")
+                    if sid:
+                        reports_map[sid] = r
+            else:
+                # Reviewers and admins see all sessions and reports
+                raw_reports = await db["interview_reports"].find({}).sort("created_at", -1).to_list(500)
+                for r in raw_reports:
+                    sid = r.get("session_id")
+                    if sid:
+                        reports_map[sid] = r
+
+                raw_sessions = await db["interview_sessions"].find({}).sort("created_at", -1).to_list(500)
+                for s in raw_sessions:
+                    sid = s.get("session_id")
+                    if sid:
+                        persisted_session_ids.add(sid)
+                sessions_list.extend(raw_sessions)
         except Exception as exc:
             logger.warning("Error querying MongoDB for available reports: %s", type(exc).__name__)
 
-    # 2. Merge in-memory store (fallback when MongoDB is unavailable or session was memory-only)
-    for sid, r in _in_memory_reports.items():
-        if sid not in reports_map:
-            reports_map[sid] = r
-    for sid, s in _in_memory_sessions.items():
-        if not any(existing.get("session_id") == sid for existing in sessions_list):
-            sessions_list.append(s)
+    # 2. Merge in-memory store (filtered by candidate ownership)
+    if is_candidate:
+        cand_mem_sids = {
+            sid for sid, s in _in_memory_sessions.items()
+            if s.get("owner_id") == user_id
+        }
+        for sid, r in _in_memory_reports.items():
+            rep_owner = r.get("owner_id") or _in_memory_sessions.get(sid, {}).get("owner_id")
+            if (rep_owner == user_id or sid in cand_mem_sids) and sid not in reports_map:
+                reports_map[sid] = r
+        for sid, s in _in_memory_sessions.items():
+            if s.get("owner_id") == user_id:
+                if not any(existing.get("session_id") == sid for existing in sessions_list):
+                    sessions_list.append(s)
+    else:
+        for sid, r in _in_memory_reports.items():
+            if sid not in reports_map:
+                reports_map[sid] = r
+        for sid, s in _in_memory_sessions.items():
+            if not any(existing.get("session_id") == sid for existing in sessions_list):
+                sessions_list.append(s)
 
     # 3. If there are reports whose session_id was not in sessions_list, synthesize session entry
     known_session_ids = {s.get("session_id") for s in sessions_list}
     for sid, r in reports_map.items():
         if sid not in known_session_ids:
+            rep_owner = r.get("owner_id")
+            if is_candidate and rep_owner != user_id:
+                continue
             sessions_list.append({
                 "session_id": sid,
                 "role": r.get("role", "Candidate"),
@@ -1219,7 +1271,7 @@ async def list_available_reports(
                 "interview_mode": r.get("interview_mode"),
                 "created_at": r.get("created_at"),
                 "status": "completed",
-                "owner_id": r.get("owner_id"),
+                "owner_id": rep_owner,
                 "resume_analysis_id": r.get("associated_analysis_id"),
             })
             known_session_ids.add(sid)
@@ -1228,12 +1280,15 @@ async def list_available_reports(
     items: List[AvailableReportItem] = []
     for s in sessions_list:
         owner = s.get("owner_id")
+        sid = s.get("session_id")
+        rep = reports_map.get(sid)
+        rep_owner = rep.get("owner_id") if rep else None
+
+        effective_owner = owner or rep_owner
 
         if is_candidate:
-            if owner and owner != user_id:
-                continue
-        elif not current_user:
-            if owner:
+            # Candidates must ONLY see reports/sessions they own; NEVER unowned or other users'
+            if effective_owner != user_id:
                 continue
 
         sid = s.get("session_id")
@@ -1497,8 +1552,30 @@ async def get_interview_session(
         "criterion averages, resume-to-interview evidence correlation, and qualitative coaching."
     ),
 )
-async def create_final_report(session_id: str) -> InterviewReportResponse:
+async def create_final_report(
+    session_id: str,
+    current_user: Optional[Dict[str, Any]] = Depends(get_optional_user),
+) -> InterviewReportResponse:
     """Generate final interview decision intelligence report."""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Interview session '{session_id}' not found.",
+        )
+    session_owner = session.get("owner_id")
+    if session_owner:
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required to generate this private report.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if current_user.get("role") == ROLE_CANDIDATE and session_owner != current_user.get("user_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access forbidden: You cannot generate reports for another candidate's session.",
+            )
     report = await generate_interview_report(session_id)
     await complete_session(session_id)
     return report
@@ -1518,10 +1595,10 @@ async def fetch_final_report(
     """Retrieve existing or compile final report for an interview session."""
     target_session_id = session_id
     session = await get_session(session_id)
+    rep_doc = None
 
     # Fallback: if session not found by session_id, check if caller provided a report_id
     if not session:
-        rep_doc = None
         if settings.is_mongodb_configured:
             try:
                 db = db_manager.get_database()
@@ -1537,24 +1614,40 @@ async def fetch_final_report(
             target_session_id = rep_doc["session_id"]
             session = await get_session(target_session_id)
 
-    if session:
-        session_owner = session.get("owner_id")
-        if session_owner:
-            if not current_user:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication required to view this private report.",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            if current_user.get("role") == ROLE_CANDIDATE and session_owner != current_user.get("user_id"):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access forbidden: You cannot view another candidate's private report.",
-                )
     report = await get_interview_report(target_session_id)
     if not report:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Interview session '{session_id}' not found.",
         )
+
+    # Resolve effective owner across report, session, or document
+    effective_owner = report.owner_id
+    if not effective_owner and session:
+        effective_owner = session.get("owner_id")
+    if not effective_owner and rep_doc:
+        effective_owner = rep_doc.get("owner_id")
+
+    # Access control enforcement
+    if effective_owner:
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required to view this private report.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if current_user.get("role") == ROLE_CANDIDATE and effective_owner != current_user.get("user_id"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access forbidden: You cannot view another candidate's private report.",
+            )
+    else:
+        # Report lacks an owner (legacy unassociated report)
+        # Candidates must NEVER be exposed to legacy reports that lack an ownership field
+        if current_user and current_user.get("role") == ROLE_CANDIDATE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access forbidden: Unassociated legacy reports cannot be viewed by candidates.",
+            )
+
     return report

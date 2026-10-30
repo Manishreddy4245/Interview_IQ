@@ -401,6 +401,7 @@ class InterviewReportResponse(BaseModel):
     learning_roadmap: List[PersonalizedRoadmapItem] = Field(default_factory=list)
 
     # Persistence transparency
+    owner_id: Optional[str] = Field(default=None, description="Owner user ID for RBAC isolation")
     saved_to_db: bool
     db_status: str
     db_message: Optional[str] = None

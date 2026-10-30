@@ -1253,6 +1253,7 @@ async def generate_interview_report(session_id: str) -> InterviewReportResponse:
     report_doc = {
         "report_id": report_id,
         "session_id": session_id,
+        "owner_id": session.get("owner_id"),
         "created_at": now.isoformat(),
         "role": role,
         "experience_level": experience_level,
@@ -1303,6 +1304,7 @@ async def generate_interview_report(session_id: str) -> InterviewReportResponse:
     return InterviewReportResponse(
         report_id=report_id,
         session_id=session_id,
+        owner_id=session.get("owner_id"),
         created_at=now,
         role=role,
         experience_level=experience_level,
@@ -1485,6 +1487,10 @@ async def get_interview_report(session_id: str) -> Optional[InterviewReportRespo
             doc = await db["interview_reports"].find_one({"session_id": session_id})
             if doc:
                 doc.pop("_id", None)
+                if not doc.get("owner_id"):
+                    sess = await get_session(session_id)
+                    if sess and sess.get("owner_id"):
+                        doc["owner_id"] = sess.get("owner_id")
                 if isinstance(doc.get("created_at"), str):
                     doc["created_at"] = datetime.fromisoformat(doc["created_at"])
                 doc["saved_to_db"] = True
@@ -1498,6 +1504,10 @@ async def get_interview_report(session_id: str) -> Optional[InterviewReportRespo
     # 2. Check in-memory
     if session_id in _in_memory_reports:
         doc = dict(_in_memory_reports[session_id])
+        if not doc.get("owner_id"):
+            sess = await get_session(session_id)
+            if sess and sess.get("owner_id"):
+                doc["owner_id"] = sess.get("owner_id")
         if isinstance(doc.get("created_at"), str):
             doc["created_at"] = datetime.fromisoformat(doc["created_at"])
         doc["saved_to_db"] = False
