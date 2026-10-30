@@ -1,4 +1,5 @@
 import logging
+import re
 import uuid
 from typing import Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -60,7 +61,7 @@ class SwitchRoleDemoRequest(BaseModel):
 )
 async def login_for_access_token(payload: LoginRequest) -> TokenResponse:
     """Issue JWT token with role claims upon valid credentials."""
-    user = authenticate_user(payload.username, payload.password)
+    user = await authenticate_user(payload.username, payload.password)
     if not user:
         logger.warning("Failed login attempt for username: %s", payload.username)
         raise HTTPException(
@@ -73,6 +74,7 @@ async def login_for_access_token(payload: LoginRequest) -> TokenResponse:
         user_id=user["user_id"],
         role=user["role"],
         name=user["name"],
+        username=user.get("username"),
     )
 
     return TokenResponse(
@@ -127,12 +129,24 @@ async def register_candidate(payload: RegisterRequest) -> TokenResponse:
     if settings.is_mongodb_configured:
         try:
             db = db_manager.get_database()
-            existing_doc = await db["users"].find_one({"username": {"$regex": f"^{clean_username}$", "$options": "i"}})
-            if existing_doc:
+            existing_uname = await db["users"].find_one(
+                {"username": {"$regex": f"^{re.escape(clean_username)}$", "$options": "i"}}
+            )
+            if existing_uname:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Username '{clean_username}' is already registered.",
                 )
+            if payload.email and payload.email.strip():
+                clean_email = payload.email.strip().lower()
+                existing_email = await db["users"].find_one(
+                    {"email": {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}}
+                )
+                if existing_email:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Email '{payload.email.strip()}' is already registered.",
+                    )
         except HTTPException:
             raise
         except Exception as exc:
@@ -178,6 +192,7 @@ async def register_candidate(payload: RegisterRequest) -> TokenResponse:
         user_id=user_id,
         role=assigned_role,
         name=payload.name.strip(),
+        username=clean_username,
     )
 
     return TokenResponse(
@@ -223,6 +238,7 @@ async def get_demo_role_token(payload: SwitchRoleDemoRequest) -> TokenResponse:
         user_id=matching_user["user_id"],
         role=matching_user["role"],
         name=matching_user["name"],
+        username=matching_user["username"],
     )
 
     return TokenResponse(
@@ -250,17 +266,38 @@ async def get_current_user_profile(
     role = current_user.get("role", ROLE_CANDIDATE)
     permissions = ROLE_PERMISSIONS.get(role, [])
 
-    # Find username from USERS_DB if present
-    username = "unknown"
-    for u in USERS_DB.values():
-        if u["user_id"] == current_user.get("user_id"):
-            username = u["username"]
-            break
+    user_id = current_user.get("user_id")
+    username = current_user.get("username")
+    name = current_user.get("name", "User")
+
+    # If username not in token claims, look in USERS_DB
+    if not username:
+        for u in USERS_DB.values():
+            if u.get("user_id") == user_id:
+                username = u.get("username")
+                if name in (None, "User") and u.get("name"):
+                    name = u["name"]
+                break
+
+    # If still not found, check MongoDB Atlas
+    if not username and settings.is_mongodb_configured:
+        try:
+            db = db_manager.get_database()
+            doc = await db["users"].find_one({"user_id": user_id})
+            if doc:
+                username = doc.get("username")
+                if name in (None, "User") and doc.get("name"):
+                    name = doc["name"]
+        except Exception as exc:
+            logger.warning("MongoDB lookup warning during /me profile fetch: %s", type(exc).__name__)
+
+    if not username:
+        username = "unknown"
 
     return UserProfile(
-        user_id=current_user["user_id"],
+        user_id=user_id or "usr_unknown",
         username=username,
-        name=current_user.get("name", "User"),
+        name=name,
         role=role,
         permissions=permissions,
     )

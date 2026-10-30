@@ -255,3 +255,98 @@ async def test_case_9_unauthorized_cross_candidate_isolation(client):
     # Clean up
     await db["interview_sessions"].delete_one({"_id": sess_id})
     await db["interview_reports"].delete_one({"_id": f"rep_{sess_id}"})
+
+
+@pytest.mark.asyncio
+async def test_case_10_live_atlas_user_registration_server_restart_and_login(client):
+    """
+    Case 10: Live Atlas authentication lifecycle:
+    1. Register user -> saved to MongoDB Atlas 'users' collection.
+    2. Simulate server restart by clearing USERS_DB in memory.
+    3. Login via /api/auth/token succeeds using MongoDB credentials.
+    4. Protected route /api/auth/me returns authentic user profile.
+    5. Case-insensitive username and email logins succeed.
+    6. Incorrect password fails with 401.
+    """
+    import uuid
+    from app.core.security import USERS_DB
+
+    db = db_manager.get_database()
+    uid = uuid.uuid4().hex[:6]
+    test_username = f"live_cand_{uid}"
+    test_email = f"live_{uid}@interviewiq-test.com"
+    test_pwd = "LiveAtlasPassword123!"
+
+    # 1. Register candidate
+    reg_res = client.post("/api/auth/register", json={
+        "username": test_username,
+        "name": "Live Candidate Test",
+        "email": test_email,
+        "password": test_pwd,
+    })
+    assert reg_res.status_code == 201
+    reg_data = reg_res.json()
+    assert reg_data["username"] == test_username
+    assert reg_data["role"] == "candidate"
+
+    # 2. Verify document landed in live Atlas 'users' collection
+    atlas_user = await db["users"].find_one({"username": test_username})
+    assert atlas_user is not None
+    assert atlas_user["email"] == test_email.lower()
+    assert atlas_user["role"] == "candidate"
+    assert "password_hash" in atlas_user
+
+    # 3. Simulate server restart: purge from in-memory USERS_DB
+    USERS_DB.pop(test_username, None)
+    for k in list(USERS_DB.keys()):
+        if USERS_DB[k].get("username") == test_username:
+            del USERS_DB[k]
+
+    # Verify user is genuinely absent from memory
+    assert test_username not in USERS_DB
+
+    # 4. Login by username (must read from Atlas)
+    login_res = client.post("/api/auth/token", json={
+        "username": test_username,
+        "password": test_pwd,
+    })
+    assert login_res.status_code == 200
+    login_data = login_res.json()
+    assert login_data["username"] == test_username
+    assert login_data["role"] == "candidate"
+    assert "access_token" in login_data
+    token = login_data["access_token"]
+
+    # 5. Verify /api/auth/me returns genuine username from Atlas
+    me_res = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert me_res.status_code == 200
+    me_data = me_res.json()
+    assert me_data["username"] == test_username
+    assert me_data["role"] == "candidate"
+
+    # 6. Login by email (case-insensitive)
+    email_login_res = client.post("/api/auth/token", json={
+        "username": test_email.upper(),
+        "password": test_pwd,
+    })
+    assert email_login_res.status_code == 200
+    assert email_login_res.json()["username"] == test_username
+
+    # 7. Login by username (uppercase)
+    upper_login_res = client.post("/api/auth/token", json={
+        "username": test_username.upper(),
+        "password": test_pwd,
+    })
+    assert upper_login_res.status_code == 200
+    assert upper_login_res.json()["username"] == test_username
+
+    # 8. Incorrect password rejected
+    bad_res = client.post("/api/auth/token", json={
+        "username": test_username,
+        "password": "CompletelyWrongPassword!",
+    })
+    assert bad_res.status_code == 401
+    assert "invalid username or password" in bad_res.json()["detail"].lower()
+
+    # Clean up test user from live Atlas
+    await db["users"].delete_one({"username": test_username})

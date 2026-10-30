@@ -3,6 +3,7 @@ import hmac
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 import jwt
@@ -10,6 +11,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import settings
+from app.core.database import db_manager
 
 logger = logging.getLogger("interviewiq.security")
 
@@ -83,14 +85,14 @@ USERS_DB: Dict[str, Dict[str, Any]] = {
 }
 
 
-def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
-    """Authenticate username or email and password against verified accounts."""
+async def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
+    """Authenticate username or email and password against verified accounts in memory and MongoDB Atlas."""
     clean_id = username.strip()
-    # 1. Exact username match
+    clean_lower = clean_id.lower()
+
+    # 1. Exact or case-insensitive username or email match from in-memory USERS_DB
     user = USERS_DB.get(clean_id)
-    # 2. Case-insensitive username or email match
     if not user:
-        clean_lower = clean_id.lower()
         for u in USERS_DB.values():
             if u.get("username", "").lower() == clean_lower:
                 user = u
@@ -98,11 +100,42 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
             if u.get("email") and u.get("email", "").lower() == clean_lower:
                 user = u
                 break
-    if not user:
-        return None
-    if not verify_password(password, user["password_hash"]):
-        return None
-    return user
+
+    if user and verify_password(password, user.get("password_hash", "")):
+        return user
+
+    # 2. Case-insensitive username or email match from MongoDB Atlas
+    if settings.is_mongodb_configured:
+        try:
+            db = db_manager.get_database()
+            query = {
+                "$or": [
+                    {"username": {"$regex": f"^{re.escape(clean_id)}$", "$options": "i"}},
+                    {"email": {"$regex": f"^{re.escape(clean_id)}$", "$options": "i"}},
+                ]
+            }
+            doc = await db["users"].find_one(query)
+            if doc and doc.get("password_hash"):
+                if verify_password(password, doc["password_hash"]):
+                    role = doc.get("role", ROLE_CANDIDATE)
+                    if role not in VALID_ROLES:
+                        role = ROLE_CANDIDATE
+                    user_dict = {
+                        "user_id": doc.get("user_id", f"usr_{doc.get('username')}"),
+                        "username": doc.get("username", clean_id),
+                        "name": doc.get("name", doc.get("username", "User")),
+                        "email": doc.get("email"),
+                        "role": role,
+                        "password_hash": doc["password_hash"],
+                    }
+                    # Populate in-memory cache for fast session access
+                    USERS_DB[user_dict["username"]] = user_dict
+                    return user_dict
+                return None
+        except Exception as exc:
+            logger.error("MongoDB Atlas error during user authentication: %s", type(exc).__name__)
+
+    return None
 
 
 
@@ -111,6 +144,7 @@ def create_access_token(
     role: str,
     name: str,
     expires_delta: Optional[timedelta] = None,
+    username: Optional[str] = None,
 ) -> str:
     """Create a signed JWT access token containing subject, role, and expiration."""
     if role not in VALID_ROLES:
@@ -129,6 +163,8 @@ def create_access_token(
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
     }
+    if username:
+        payload["username"] = username
 
     token = jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
     return token
@@ -187,6 +223,7 @@ async def get_current_user(
         "user_id": user_id,
         "role": role,
         "name": payload.get("name", "User"),
+        "username": payload.get("username"),
     }
 
 
@@ -202,6 +239,7 @@ async def get_optional_user(
             "user_id": payload.get("sub"),
             "role": payload.get("role"),
             "name": payload.get("name"),
+            "username": payload.get("username"),
         }
     except Exception:
         return None

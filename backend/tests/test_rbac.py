@@ -346,3 +346,81 @@ def test_session_expiration_and_malformed_tokens():
     tamper_res = client.get("/api/auth/me", headers={"Authorization": f"Bearer {tampered_token}"})
     assert tamper_res.status_code == 401
     assert "invalid" in tamper_res.json()["detail"].lower()
+
+
+def test_login_from_mongodb_when_memory_cleared(monkeypatch):
+    """Verify that a user stored in MongoDB can authenticate even after in-memory USERS_DB is cleared (simulating server restart)."""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.core.config import settings
+    from app.core.database import db_manager
+    from app.core.security import USERS_DB, hash_password
+
+    # Configure MongoDB
+    monkeypatch.setattr(settings, "MONGODB_URI", "mongodb+srv://test:test@cluster.mongodb.net/interviewiq")
+
+    mock_db = MagicMock()
+    mock_collection = MagicMock()
+
+    fake_user_doc = {
+        "user_id": "usr_cand_mongo_99",
+        "username": "mongo_candidate",
+        "name": "Mongo Candidate",
+        "email": "mongo_candidate@example.com",
+        "role": "candidate",
+        "password_hash": hash_password("ValidPassword123!"),
+    }
+
+    async def mock_find_one(query):
+        # Query matching username or email
+        if "$or" in query:
+            clean_input = "mongo_candidate"
+            for condition in query["$or"]:
+                if "username" in condition:
+                    pattern = condition["username"]["$regex"]
+                    if "mongo_candidate" in pattern.lower():
+                        return fake_user_doc
+                if "email" in condition:
+                    pattern = condition["email"]["$regex"]
+                    if "mongo_candidate@example.com" in pattern.lower():
+                        return fake_user_doc
+        return None
+
+    mock_collection.find_one = AsyncMock(side_effect=mock_find_one)
+    mock_db.__getitem__.return_value = mock_collection
+    monkeypatch.setattr(db_manager, "get_database", lambda: mock_db)
+
+    # Ensure user is NOT in memory (simulating server restart)
+    USERS_DB.pop("mongo_candidate", None)
+    for k in list(USERS_DB.keys()):
+        if USERS_DB[k].get("username") == "mongo_candidate":
+            del USERS_DB[k]
+
+    # 1. Login with valid username
+    res = client.post("/api/auth/token", json={"username": "mongo_candidate", "password": "ValidPassword123!"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["username"] == "mongo_candidate"
+    assert data["role"] == "candidate"
+    assert data["user_id"] == "usr_cand_mongo_99"
+    token = data["access_token"]
+
+    # 2. Access protected route with token
+    me_res = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert me_res.status_code == 200
+    assert me_res.json()["username"] == "mongo_candidate"
+    assert me_res.json()["role"] == "candidate"
+
+    # 3. Login with email
+    res_email = client.post("/api/auth/token", json={"username": "mongo_candidate@example.com", "password": "ValidPassword123!"})
+    assert res_email.status_code == 200
+    assert res_email.json()["username"] == "mongo_candidate"
+
+    # 4. Login with wrong password is rejected
+    bad_res = client.post("/api/auth/token", json={"username": "mongo_candidate", "password": "WrongPassword!"})
+    assert bad_res.status_code == 401
+    assert "invalid username or password" in bad_res.json()["detail"].lower()
+
+    # 5. Login with non-existent user is rejected
+    none_res = client.post("/api/auth/token", json={"username": "unknown_ghost_user", "password": "ValidPassword123!"})
+    assert none_res.status_code == 401
+    assert "invalid username or password" in none_res.json()["detail"].lower()
